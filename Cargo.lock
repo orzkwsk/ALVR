@@ -263,6 +263,7 @@ dependencies = [
  "alvr_session",
  "alvr_system_info",
  "android-activity",
+ "getrandom 0.3.4",
  "jni 0.22.4",
  "libc",
  "ndk-context",
@@ -384,6 +385,7 @@ version = "21.0.0-dev14"
 dependencies = [
  "alvr_common",
  "alvr_session",
+ "bincode",
  "regex",
  "serde",
  "serde_json",
@@ -404,6 +406,7 @@ dependencies = [
  "alvr_sockets",
  "ash",
  "axum",
+ "bincode",
  "chrono",
  "fern",
  "flume",

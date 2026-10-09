@@ -167,13 +167,15 @@ void* Hmd::get_component(const char* component_name_and_version) {
     return nullptr;
 }
 
-void Hmd::OnPoseUpdated(uint64_t targetTimestampNs, FfiDeviceMotion motion) {
+void Hmd::OnPoseUpdated(
+    uint64_t targetTimestampNs, FfiDeviceMotion motion, FfiHmdAuthorityEvidenceV1 authority
+) {
     Debug("Hmd::OnPoseUpdated");
 
     if (this->object_id == vr::k_unTrackedDeviceIndexInvalid) {
         return;
     }
-    auto pose = vr::DriverPose_t {};
+    auto pose = vr::DriverPose_t { };
     pose.poseIsValid = true;
     pose.result = vr::TrackingResult_Running_OK;
     pose.deviceIsConnected = true;
@@ -192,7 +194,11 @@ void Hmd::OnPoseUpdated(uint64_t targetTimestampNs, FfiDeviceMotion motion) {
     pose.vecPosition[1] = motion.pose.position[1];
     pose.vecPosition[2] = motion.pose.position[2];
 
+    if (!hmd_authority_submit_gate.accept(authority))
+        authority.present = 0;
+    last_hmd_authority = { authority, pose };
     this->submit_pose(pose);
+    TraceHmdAuthority(last_hmd_authority);
 
     m_poseHistory->OnPoseUpdated(targetTimestampNs, motion);
 
@@ -294,7 +300,7 @@ void Hmd::SetViewParams(const FfiViewParams params[2]) {
 
     // todo: check if this is still needed
     vr::VRServerDriverHost()->VendorSpecificEvent(
-        object_id, vr::VREvent_LensDistortionChanged, {}, 0
+        object_id, vr::VREvent_LensDistortionChanged, { }, 0
     );
 }
 

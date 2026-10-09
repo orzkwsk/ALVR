@@ -7,6 +7,12 @@ mod passthrough;
 mod stream;
 
 use crate::stream::ParsedStreamConfig;
+use alvr_common::hmd_authority::{
+    AuthoritySessionRegistry, HmdAuthoritySessionEpoch, ReferenceSpaceKind,
+};
+use alvr_common::parking_lot::Mutex;
+static AUTHORITY_SESSIONS: std::sync::LazyLock<Mutex<AuthoritySessionRegistry>> =
+    std::sync::LazyLock::new(|| Mutex::new(AuthoritySessionRegistry::default()));
 use alvr_client_core::{ClientCapabilities, ClientCoreContext, ClientCoreEvent};
 use alvr_common::{
     Fov, HAND_LEFT_ID, Pose, debug, error,
@@ -281,6 +287,7 @@ pub fn entry_point() {
 
     let mut last_lobby_message = String::new();
 
+    // XrSession, not stream/network lifetime, owns the authority epoch.
     'session_loop: loop {
         let xr_system = xr_instance
             .system(xr::FormFactor::HEAD_MOUNTED_DISPLAY)
@@ -293,6 +300,19 @@ pub fn entry_point() {
 
         let (xr_session, mut xr_frame_waiter, mut xr_frame_stream) =
             create_session(&xr_instance, xr_system, &graphics_context);
+        let authority = Arc::new(Mutex::new(loop {
+            let mut bytes = [0u8; 16];
+            if let Err(error) = getrandom::fill(&mut bytes) {
+                error!("HMD authority unavailable: OS entropy failure {error}");
+                break alvr_common::hmd_authority::HmdAuthorityState::unavailable();
+            }
+            if let Some(state) = AUTHORITY_SESSIONS
+                .lock()
+                .start(HmdAuthoritySessionEpoch(bytes))
+            {
+                break state;
+            }
+        }));
 
         let views_config = xr_instance
             .enumerate_view_configuration_views(
@@ -416,36 +436,78 @@ pub fn entry_point() {
             while let Some(event) = xr_instance.poll_event(&mut event_storage).unwrap() {
                 match event {
                     xr::Event::EventsLost(event) => {
-                        error!("OpenXR: lost {} events!", event.lost_event_count());
+                        authority.lock().events_lost(event.lost_event_count());
+                        error!(
+                            "MONAKA_ALVR_HMD_AUTHORITY_V1 EventsLost count={} authority invalidated",
+                            event.lost_event_count()
+                        );
                     }
-                    xr::Event::InstanceLossPending(_) => break 'session_loop,
-                    xr::Event::SessionStateChanged(event) => match event.state() {
-                        xr::SessionState::READY => {
-                            xr_session
-                                .begin(xr::ViewConfigurationType::PRIMARY_STEREO)
-                                .unwrap();
+                    xr::Event::InstanceLossPending(_) => {
+                        authority.lock().retire();
+                        break 'session_loop;
+                    }
+                    xr::Event::SessionStateChanged(event)
+                        if event.session() == xr_session.as_raw() =>
+                    {
+                        match event.state() {
+                            xr::SessionState::READY => {
+                                xr_session
+                                    .begin(xr::ViewConfigurationType::PRIMARY_STEREO)
+                                    .unwrap();
 
-                            core_context.resume();
+                                authority.lock().begin();
+                                core_context.resume();
 
-                            passthrough_layer = PassthroughLayer::new(&xr_session, platform).ok();
+                                passthrough_layer =
+                                    PassthroughLayer::new(&xr_session, platform).ok();
 
-                            session_running = true;
+                                session_running = true;
+                            }
+                            xr::SessionState::STOPPING => {
+                                authority.lock().stop();
+                                session_running = false;
+
+                                passthrough_layer = None;
+
+                                core_context.pause();
+
+                                xr_session.end().ok();
+                            }
+                            xr::SessionState::EXITING | xr::SessionState::LOSS_PENDING => {
+                                authority.lock().retire();
+                                break 'render_loop;
+                            }
+                            _ => (),
                         }
-                        xr::SessionState::STOPPING => {
-                            session_running = false;
-
-                            passthrough_layer = None;
-
-                            core_context.pause();
-
-                            xr_session.end().ok();
-                        }
-                        xr::SessionState::EXITING | xr::SessionState::LOSS_PENDING => {
-                            break 'render_loop;
-                        }
-                        _ => (),
-                    },
-                    xr::Event::ReferenceSpaceChangePending(event) => {
+                    }
+                    xr::Event::ReferenceSpaceChangePending(event)
+                        if event.session() == xr_session.as_raw() =>
+                    {
+                        let kind = match event.reference_space_type() {
+                            xr::ReferenceSpaceType::STAGE => ReferenceSpaceKind::Stage,
+                            xr::ReferenceSpaceType::VIEW => ReferenceSpaceKind::View,
+                            xr::ReferenceSpaceType::LOCAL
+                            | xr::ReferenceSpaceType::LOCAL_FLOOR_EXT => {
+                                ReferenceSpaceKind::Irrelevant
+                            }
+                            _ => ReferenceSpaceKind::Unknown,
+                        };
+                        // Record boundary BEFORE space recreation. Receive time is never an epoch boundary.
+                        authority.lock().reference_change(
+                            kind,
+                            event.change_time().as_nanos(),
+                            event.pose_valid(),
+                            from_xr_pose(event.pose_in_previous_space()),
+                        );
+                        let next_generation = authority.lock().pending_generation();
+                        debug!(
+                            "MONAKA_ALVR_HMD_AUTHORITY_V1 reference_event type={kind:?} nextGeneration={next_generation} changeTime={} poseValid={} previous={:?}",
+                            event.change_time().as_nanos(),
+                            event.pose_valid(),
+                            alvr_common::hmd_authority::pose_bits(from_xr_pose(
+                                event.pose_in_previous_space()
+                            ))
+                        );
                         info!(
                             "ReferenceSpaceChangePending type: {:?}",
                             event.reference_space_type()
@@ -500,6 +562,7 @@ pub fn entry_point() {
                             Rc::clone(&graphics_context),
                             Arc::clone(&interaction_context),
                             config,
+                            Arc::clone(&authority),
                         );
 
                         if !context.uses_passthrough() {

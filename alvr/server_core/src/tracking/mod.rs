@@ -1,3 +1,5 @@
+#[cfg(test)]
+mod authority_tests;
 mod body;
 mod eye_gaze;
 mod face;
@@ -50,10 +52,25 @@ struct MotionConfig {
     angular_velocity_cutoff: f32,
 }
 
+use alvr_common::hmd_authority::{
+    AuthorityReceiveResult, AuthorityReceiver, HmdAuthorityEvidenceV1, pose_bits,
+};
+
+#[derive(Clone, Copy, Debug)]
+pub struct MotionHistorySample {
+    pub tracking_timestamp: Duration,
+    pub motion: DeviceMotion,
+    pub hmd_authority: Option<HmdAuthorityEvidenceV1>,
+    pub server_recenter_epoch: u64,
+    pub inverse_recentering_origin: Pose,
+}
+
 pub struct TrackingManager {
+    authority_receiver: AuthorityReceiver,
+    server_recenter_epoch: u64,
     last_head_pose: Pose,             // client's reference space
     inverse_recentering_origin: Pose, // client's reference space
-    device_motions_history: HashMap<u64, VecDeque<(Duration, DeviceMotion)>>,
+    device_motions_history: HashMap<u64, VecDeque<MotionHistorySample>>,
     hand_skeletons_history: [VecDeque<(Duration, [Pose; 26])>; 2],
     combined_eye_gaze_history: VecDeque<(Duration, Option<Quat>)>,
     max_history_size: usize,
@@ -62,6 +79,8 @@ pub struct TrackingManager {
 impl TrackingManager {
     pub fn new(max_history_size: usize) -> TrackingManager {
         TrackingManager {
+            authority_receiver: AuthorityReceiver::default(),
+            server_recenter_epoch: 0,
             last_head_pose: Pose::IDENTITY,
             inverse_recentering_origin: Pose::IDENTITY,
             device_motions_history: HashMap::new(),
@@ -99,11 +118,37 @@ impl TrackingManager {
             RecenteringMode::Tilted { .. } => self.last_head_pose.orientation,
         };
 
-        self.inverse_recentering_origin = Pose {
+        let mapping = Pose {
             position,
             orientation,
         }
         .inverse();
+        self.set_recenter_mapping(mapping);
+    }
+
+    fn set_recenter_mapping(&mut self, mapping: Pose) {
+        if pose_bits(mapping) != pose_bits(self.inverse_recentering_origin) {
+            if let Some(epoch) = self.server_recenter_epoch.checked_add(1) {
+                self.server_recenter_epoch = epoch;
+            } else {
+                // Never reuse a mapping epoch. Retire authority, but retain ordinary mapping.
+                self.authority_receiver = AuthorityReceiver::default();
+                self.server_recenter_epoch = u64::MAX;
+            }
+            self.inverse_recentering_origin = mapping;
+        }
+    }
+
+    /// Network reconnect clears generic history but never resets source replay high-water.
+    pub fn reset_history(&mut self, max_history_size: usize) {
+        self.max_history_size = max_history_size;
+        self.last_head_pose = Pose::IDENTITY;
+        self.set_recenter_mapping(Pose::IDENTITY);
+        self.device_motions_history.clear();
+        self.hand_skeletons_history
+            .iter_mut()
+            .for_each(VecDeque::clear);
+        self.combined_eye_gaze_history.clear();
     }
 
     pub fn recenter_pose(&self, pose: Pose) -> Pose {
@@ -120,7 +165,19 @@ impl TrackingManager {
         headset_config: &HeadsetConfig,
         timestamp: Duration,
         device_motions: &[(u64, DeviceMotion)],
+        hmd_authority: Option<HmdAuthorityEvidenceV1>,
     ) {
+        // Recheck even for callers other than the network receiver, before ANY transform.
+        let heads: Vec<_> = device_motions
+            .iter()
+            .filter(|(id, _)| *id == *inp::HEAD_ID)
+            .collect();
+        let authority = hmd_authority
+            .filter(|e| heads.len() == 1 && pose_bits(heads[0].1.pose) == pose_bits(e.source_pose))
+            .filter(|e| {
+                self.server_recenter_epoch != u64::MAX
+                    && self.authority_receiver.receive(*e) == AuthorityReceiveResult::Accepted
+            });
         let mut device_motion_configs = HashMap::new();
         device_motion_configs.insert(*inp::HEAD_ID, MotionConfig::default());
         device_motion_configs.extend([
@@ -178,54 +235,69 @@ impl TrackingManager {
                     cutoff(motion.angular_velocity, config.angular_velocity_cutoff);
             }
 
+            let sample = MotionHistorySample {
+                tracking_timestamp: timestamp,
+                motion,
+                hmd_authority: if device_id == *inp::HEAD_ID {
+                    authority
+                } else {
+                    None
+                },
+                server_recenter_epoch: self.server_recenter_epoch,
+                inverse_recentering_origin: self.inverse_recentering_origin,
+            };
             if let Some(motions) = self.device_motions_history.get_mut(&device_id) {
-                motions.push_front((timestamp, motion));
+                motions.push_front(sample);
 
                 if motions.len() > self.max_history_size {
                     motions.pop_back();
                 }
             } else {
                 self.device_motions_history
-                    .insert(device_id, VecDeque::from(vec![(timestamp, motion)]));
+                    .insert(device_id, VecDeque::from(vec![sample]));
             }
         }
     }
 
     // If the exact sample_timestamp is not found, use the closest one if it's not older. This makes
     // sure that we return None if there is no newer sample and always return Some otherwise.
+    pub fn get_device_motion_sample(
+        &self,
+        device_id: u64,
+        sample_timestamp: Duration,
+    ) -> Option<MotionHistorySample> {
+        // Equal/nearest-newer, preserving original front-first duplicate-timestamp behavior.
+        let mut best: Option<&MotionHistorySample> = None;
+        for sample in self.device_motions_history.get(&device_id)? {
+            match sample.tracking_timestamp.cmp(&sample_timestamp) {
+                Ordering::Equal => {
+                    best = Some(sample);
+                    break;
+                }
+                Ordering::Greater => {
+                    if best.is_none_or(|b| sample.tracking_timestamp < b.tracking_timestamp) {
+                        best = Some(sample);
+                    }
+                }
+                Ordering::Less => (),
+            }
+        }
+        best.copied().map(|mut sample| {
+            // A conflict/session switch revokes even evidence already retained in history.
+            sample.hmd_authority = sample
+                .hmd_authority
+                .filter(|e| self.authority_receiver.eligible(e.session_epoch));
+            sample
+        })
+    }
+
     pub fn get_device_motion(
         &self,
         device_id: u64,
         sample_timestamp: Duration,
     ) -> Option<DeviceMotion> {
-        self.device_motions_history
-            .get(&device_id)
-            .and_then(|motions| {
-                // Get first element to initialize a valid motion reference
-                if let Some((_, motion)) = motions.front() {
-                    let mut best_timestamp_diff = Duration::MAX;
-                    let mut best_motion_ref = motion;
-
-                    // Note: we are iterating from most recent to oldest
-                    for (ts, m) in motions {
-                        match ts.cmp(&sample_timestamp) {
-                            Ordering::Equal => return Some(*m),
-                            Ordering::Greater => {
-                                let diff = ts.saturating_sub(sample_timestamp);
-                                if diff < best_timestamp_diff {
-                                    best_timestamp_diff = diff;
-                                    best_motion_ref = m;
-                                }
-                            }
-                            Ordering::Less => continue,
-                        }
-                    }
-
-                    (best_timestamp_diff != Duration::MAX).then_some(*best_motion_ref)
-                } else {
-                    None
-                }
-            })
+        self.get_device_motion_sample(device_id, sample_timestamp)
+            .map(|sample| sample.motion)
     }
 
     pub fn report_hand_skeleton(
@@ -349,6 +421,15 @@ pub fn tracking_loop(
             return;
         };
 
+        // Same decoded packet; reject only evidence before extensions or transforms.
+        let binding_valid = tracking.validate_hmd_authority();
+        if std::env::var("MONAKA_ALVR_HMD_AUTHORITY_TRACE").as_deref() == Ok("1") {
+            alvr_common::info!(
+                "MONAKA_ALVR_HMD_AUTHORITY_V1 server binding={} evidence={:?}",
+                binding_valid,
+                tracking.hmd_authority
+            );
+        }
         let timestamp = tracking.poll_timestamp;
 
         if eye_tracking_osc_port.is_some() {
@@ -420,6 +501,7 @@ pub fn tracking_loop(
                 headset_config,
                 timestamp,
                 &tracking.device_motions,
+                tracking.hmd_authority,
             );
 
             if let Some(skeleton) = tracking.hand_skeletons[0] {

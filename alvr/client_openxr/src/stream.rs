@@ -30,6 +30,11 @@ use std::{
     time::{Duration, Instant},
 };
 
+use alvr_common::{
+    hmd_authority::{HmdAuthorityState, pose_bits},
+    parking_lot::Mutex,
+};
+
 const DECODER_MAX_TIMEOUT_MULTIPLIER: f32 = 0.8;
 
 pub struct ParsedStreamConfig {
@@ -81,6 +86,7 @@ impl ParsedStreamConfig {
 }
 
 pub struct StreamContext {
+    authority: Arc<Mutex<HmdAuthorityState>>,
     core_context: Arc<ClientCoreContext>,
     xr_session: xr::Session<xr::OpenGlEs>,
     interaction_context: Arc<RwLock<InteractionContext>>,
@@ -104,6 +110,7 @@ impl StreamContext {
         gfx_ctx: Rc<GraphicsContext>,
         interaction_ctx: Arc<RwLock<InteractionContext>>,
         config: ParsedStreamConfig,
+        authority: Arc<Mutex<HmdAuthorityState>>,
     ) -> StreamContext {
         interaction_ctx
             .write()
@@ -224,6 +231,7 @@ impl StreamContext {
         ));
 
         let mut this = StreamContext {
+            authority,
             use_custom_reprojection: core_ctx.platform().is_yvr(),
             core_context: core_ctx,
             xr_session,
@@ -285,6 +293,7 @@ impl StreamContext {
             let view_reference_space = Arc::clone(&self.view_reference_space);
             let refresh_rate = self.config.refresh_rate_hint;
             let running = Arc::clone(&self.input_thread_running);
+            let authority = Arc::clone(&self.authority);
             move || {
                 stream_input_loop(
                     &core_ctx,
@@ -294,6 +303,7 @@ impl StreamContext {
                     &view_reference_space,
                     refresh_rate,
                     running,
+                    authority,
                 )
             }
         }));
@@ -526,6 +536,10 @@ impl Drop for StreamContext {
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The authority gate is shared with the XrSession owner"
+)]
 fn stream_input_loop(
     core_ctx: &ClientCoreContext,
     xr_session: xr::Session<xr::OpenGlEs>,
@@ -534,6 +548,7 @@ fn stream_input_loop(
     view_reference_space: &xr::Space,
     refresh_rate: f32,
     running: Arc<RelaxedAtomic>,
+    authority: Arc<Mutex<HmdAuthorityState>>,
 ) {
     let mut last_controller_poses = [Pose::IDENTITY; 2];
     let mut last_palm_poses = [Pose::IDENTITY; 2];
@@ -559,7 +574,7 @@ fn stream_input_loop(
 
         let target_time = now + core_ctx.get_total_prediction_offset();
 
-        let Some((head_motion, local_views)) = interaction::get_head_data(
+        let Some((head_motion, local_views, raw_validity)) = interaction::get_head_data(
             &xr_session,
             core_ctx.platform(),
             stage_reference_space,
@@ -651,7 +666,29 @@ fn stream_input_loop(
         // with the poll timestamp instead of the vsync time. This is to ensure correctness when
         // submitting frames to OpenXR. This won't cause any desync with the server because no time
         // sync step is performed between client and server.
+        // Interaction lock released, ALL OpenXR calls completed. Event handling takes this
+        // same gate, making classification + same-packet send one ordered operation.
+        // A boundary received after this operation invalidates at the late-event gate.
+        let mut authority_gate = authority.lock();
+        let hmd_authority = authority_gate.sample(
+            crate::to_xr_time(now).as_nanos(),
+            head_motion.pose,
+            raw_validity,
+        );
+        if let Some(e) = hmd_authority {
+            alvr_common::debug!(
+                "MONAKA_ALVR_HMD_AUTHORITY_V1 client session={:?} obs={} gen={} sourceLocateTime={} poll={:?} sourceBits={:?} flags={}",
+                e.session_epoch,
+                e.observation_id,
+                e.reference_space_generation,
+                e.source_locate_time,
+                target_time,
+                pose_bits(e.source_pose),
+                e.validity.bits()
+            );
+        }
         core_ctx.send_tracking(TrackingData {
+            hmd_authority,
             poll_timestamp: target_time,
             device_motions,
             hand_skeletons: [
@@ -661,6 +698,8 @@ fn stream_input_loop(
             face,
             body,
         });
+
+        drop(authority_gate);
 
         let button_entries =
             interaction::update_buttons(&xr_session, &interaction_ctx.read().button_actions);

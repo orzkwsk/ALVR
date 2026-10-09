@@ -389,13 +389,14 @@ void SetTracking(
     unsigned long long targetTimestampNs,
     float controllerPoseTimeOffsetS,
     FfiDeviceMotion headMotion,
+    FfiHmdAuthorityEvidenceV1 hmdAuthority,
     FfiHandData leftHandData,
     FfiHandData rightHandData,
     const FfiDeviceMotion* bodyTrackerMotions,
     int bodyTrackerMotionCount
 ) {
     if (g_driver_provider.hmd) {
-        g_driver_provider.hmd->OnPoseUpdated(targetTimestampNs, headMotion);
+        g_driver_provider.hmd->OnPoseUpdated(targetTimestampNs, headMotion, hmdAuthority);
     }
 
     if (g_driver_provider.left_hand_tracker) {

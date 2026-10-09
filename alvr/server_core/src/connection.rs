@@ -1,11 +1,7 @@
 use crate::{
     ConnectionContext, FILESYSTEM_LAYOUT, SESSION_MANAGER, ServerCoreEvent,
-    ServerNegotiatedStreamingConfig,
-    bitrate::BitrateManager,
-    input_mapping::ButtonMappingManager,
-    sockets::WelcomeSocket,
-    statistics::StatisticsManager,
-    tracking::{self, TrackingManager},
+    ServerNegotiatedStreamingConfig, bitrate::BitrateManager, input_mapping::ButtonMappingManager,
+    sockets::WelcomeSocket, statistics::StatisticsManager, tracking,
 };
 use alvr_adb::{WiredConnection, WiredConnectionStatus};
 use alvr_common::{
@@ -920,8 +916,9 @@ fn connection_pipeline(
     ));
     *ctx.bitrate_manager.lock() =
         BitrateManager::new(initial_settings.video.bitrate.history_size, fps);
-    *ctx.tracking_manager.write() =
-        TrackingManager::new(initial_settings.connection.statistics_history_size);
+    ctx.tracking_manager
+        .write()
+        .reset_history(initial_settings.connection.statistics_history_size);
 
     let control_sender = Arc::new(Mutex::new(socket.request_reliable_stream()?));
     let mut video_sender = socket.request_unreliable_stream(VIDEO);

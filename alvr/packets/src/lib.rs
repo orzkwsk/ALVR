@@ -234,10 +234,34 @@ pub struct FaceData {
 #[derive(Serialize, Deserialize)]
 pub struct TrackingData {
     pub poll_timestamp: Duration,
+    /// PROTOTYPE PROTOCOL ONLY: immutable VIEW-in-STAGE locate, independent of poll_timestamp.
+    pub hmd_authority: Option<alvr_common::hmd_authority::HmdAuthorityEvidenceV1>,
     pub device_motions: Vec<(u64, DeviceMotion)>,
     pub hand_skeletons: [Option<[Pose; 26]>; 2],
     pub face: FaceData,
     pub body: Option<BodySkeleton>,
+}
+
+impl TrackingData {
+    /// Discard evidence only. Ordinary tracking and the packet timestamp are untouched.
+    pub fn validate_hmd_authority(&mut self) -> bool {
+        use alvr_common::hmd_authority::pose_bits;
+        let Some(evidence) = self.hmd_authority else {
+            return true;
+        };
+        let mut heads = self
+            .device_motions
+            .iter()
+            .filter(|(id, _)| *id == *alvr_common::HEAD_ID);
+        let valid = heads
+            .next()
+            .is_some_and(|(_, motion)| pose_bits(motion.pose) == pose_bits(evidence.source_pose))
+            && heads.next().is_none();
+        if !valid {
+            self.hmd_authority = None;
+        }
+        valid
+    }
 }
 
 #[derive(Serialize, Deserialize)]

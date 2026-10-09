@@ -1,5 +1,7 @@
 #pragma once
 
+#include <stdint.h>
+
 struct FfiFov {
     float left;
     float right;
@@ -17,6 +19,24 @@ struct FfiQuat {
 struct FfiPose {
     FfiQuat orientation;
     float position[3];
+};
+
+// PROTOTYPE PROTOCOL ONLY. All flags/counters have fixed widths; no bool ABI.
+struct FfiHmdAuthorityEvidenceV1 {
+    uint32_t present;
+    uint8_t sessionEpoch[16];
+    uint32_t rawValidityBits;
+    uint64_t observationId;
+    uint64_t referenceSpaceGeneration;
+    int64_t sourceLocateTime;
+    FfiPose sourcePose;
+    uint32_t reserved0;
+    uint64_t selectedTrackingTimestamp;
+    uint64_t predictionFromTimestamp;
+    uint64_t predictionTargetTimestamp;
+    uint64_t serverRecenterEpoch;
+    FfiPose inverseRecenteringOrigin;
+    uint32_t reserved1;
 };
 
 struct FfiDeviceMotion {
@@ -243,6 +263,7 @@ extern "C" void SetTracking(
     unsigned long long targetTimestampNs,
     float controllerPoseTimeOffsetS,
     FfiDeviceMotion headMotion,
+    FfiHmdAuthorityEvidenceV1 hmdAuthority,
     FfiHandData leftHandData,
     FfiHandData rightHandData,
     const FfiDeviceMotion* bodyTrackerMotions,

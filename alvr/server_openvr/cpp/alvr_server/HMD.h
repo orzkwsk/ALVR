@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ALVR-common/packet_types.h"
+#include "HmdAuthority.h"
 #include "TrackedDevice.h"
 #include "openvr_driver_wrap.h"
 #include <memory>
@@ -29,7 +30,11 @@ public:
 
     Hmd();
     virtual ~Hmd();
-    void OnPoseUpdated(uint64_t targetTimestampNs, FfiDeviceMotion motion);
+    void OnPoseUpdated(
+        uint64_t targetTimestampNs, FfiDeviceMotion motion, FfiHmdAuthorityEvidenceV1 authority
+    );
+    HmdAuthorityAssociationV1 last_hmd_authority;
+    HmdAuthoritySubmitGate hmd_authority_submit_gate;
     void StartStreaming();
     void StopStreaming();
     void SetViewParams(const FfiViewParams params[2]);

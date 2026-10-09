@@ -668,7 +668,11 @@ pub fn get_head_data(
     time: Duration,
     future_time: Duration,
     last_view_params: &[ViewParams; 2],
-) -> Option<(DeviceMotion, Option<[ViewParams; 2]>)> {
+) -> Option<(
+    DeviceMotion,
+    Option<[ViewParams; 2]>,
+    alvr_common::hmd_authority::HmdRawValidity,
+)> {
     let xr_time = crate::to_xr_time(time);
 
     let (head_location, head_velocity) = view_reference_space
@@ -767,7 +771,26 @@ pub fn get_head_data(
         None
     };
 
-    Some((motion, view_params))
+    Some((
+        motion,
+        view_params,
+        alvr_common::hmd_authority::HmdRawValidity {
+            position_valid: head_location
+                .location_flags
+                .contains(xr::SpaceLocationFlags::POSITION_VALID),
+            orientation_valid: head_location
+                .location_flags
+                .contains(xr::SpaceLocationFlags::ORIENTATION_VALID),
+            position_tracked: head_location
+                .location_flags
+                .contains(xr::SpaceLocationFlags::POSITION_TRACKED),
+            orientation_tracked: head_location
+                .location_flags
+                .contains(xr::SpaceLocationFlags::ORIENTATION_TRACKED),
+            view_position_valid: view_flags.contains(xr::ViewStateFlags::POSITION_VALID),
+            view_orientation_valid: view_flags.contains(xr::ViewStateFlags::ORIENTATION_VALID),
+        },
+    ))
 }
 
 #[expect(clippy::too_many_arguments)]

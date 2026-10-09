@@ -505,6 +505,7 @@ pub extern "C" fn alvr_send_tracking(
 
     if let Some(context) = &*CLIENT_CORE_CONTEXT.lock() {
         context.send_tracking(TrackingData {
+            hmd_authority: None,
             poll_timestamp: Duration::from_nanos(poll_timestamp_ns),
             device_motions,
             hand_skeletons,

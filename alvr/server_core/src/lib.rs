@@ -13,7 +13,7 @@ mod web_server;
 pub use c_api::*;
 pub use connection::align_foveation_center_shift;
 pub use logging_backend::init_logging;
-pub use tracking::HandType;
+pub use tracking::{HandType, MotionHistorySample};
 
 use crate::connection::VideoPacket;
 use alvr_common::{
@@ -264,6 +264,17 @@ impl ServerCoreContext {
         *self.connection_thread.write() = Some(thread::spawn(move || {
             connection::handshake_loop(connection_context, lifecycle_state);
         }));
+    }
+
+    pub fn get_device_motion_sample(
+        &self,
+        device_id: u64,
+        sample_timestamp: Duration,
+    ) -> Option<MotionHistorySample> {
+        self.connection_context
+            .tracking_manager
+            .read()
+            .get_device_motion_sample(device_id, sample_timestamp)
     }
 
     pub fn get_device_motion(

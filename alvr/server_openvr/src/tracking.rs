@@ -12,6 +12,39 @@ use std::{
     sync::LazyLock,
 };
 
+pub fn to_ffi_hmd_authority(
+    sample: alvr_server_core::MotionHistorySample,
+    prediction_from: std::time::Duration,
+    prediction_target: std::time::Duration,
+) -> crate::FfiHmdAuthorityEvidenceV1 {
+    let Some(e) = sample.hmd_authority else {
+        return crate::FfiHmdAuthorityEvidenceV1::default();
+    };
+    // Refuse authority rather than silently truncating any timestamp at the ABI boundary.
+    let (Ok(selected), Ok(from), Ok(target)) = (
+        u64::try_from(sample.tracking_timestamp.as_nanos()),
+        u64::try_from(prediction_from.as_nanos()),
+        u64::try_from(prediction_target.as_nanos()),
+    ) else {
+        return crate::FfiHmdAuthorityEvidenceV1::default();
+    };
+    crate::FfiHmdAuthorityEvidenceV1 {
+        present: 1,
+        sessionEpoch: e.session_epoch.0,
+        rawValidityBits: e.validity.bits(),
+        observationId: e.observation_id,
+        referenceSpaceGeneration: e.reference_space_generation,
+        sourceLocateTime: e.source_locate_time,
+        sourcePose: to_ffi_pose(e.source_pose),
+        selectedTrackingTimestamp: selected,
+        predictionFromTimestamp: from,
+        predictionTargetTimestamp: target,
+        serverRecenterEpoch: sample.server_recenter_epoch,
+        inverseRecenteringOrigin: to_ffi_pose(sample.inverse_recentering_origin),
+        ..Default::default()
+    }
+}
+
 const DEG_TO_RAD: f32 = PI / 180.0;
 
 pub static BODY_TRACKER_IDS: LazyLock<[u64; 8]> = LazyLock::new(|| {
@@ -303,5 +336,100 @@ pub fn offset_controller_motion(
                 .angular_velocity
                 .cross(motion.pose.orientation * pose_offset.position),
         angular_velocity: motion.pose.orientation.conjugate() * motion.angular_velocity,
+    }
+}
+
+#[cfg(test)]
+mod authority_ffi_tests {
+    use super::*;
+    use alvr_common::hmd_authority::*;
+    use std::{
+        mem::{align_of, offset_of, size_of},
+        time::Duration,
+    };
+    #[test]
+    fn fixed_width_layout_and_conversion() {
+        type F = crate::FfiHmdAuthorityEvidenceV1;
+        assert_eq!(size_of::<F>(), 144);
+        assert_eq!(align_of::<F>(), 8);
+        assert_eq!(
+            [
+                offset_of!(F, present),
+                offset_of!(F, sessionEpoch),
+                offset_of!(F, rawValidityBits),
+                offset_of!(F, observationId),
+                offset_of!(F, referenceSpaceGeneration),
+                offset_of!(F, sourceLocateTime),
+                offset_of!(F, sourcePose),
+                offset_of!(F, reserved0),
+                offset_of!(F, selectedTrackingTimestamp),
+                offset_of!(F, predictionFromTimestamp),
+                offset_of!(F, predictionTargetTimestamp),
+                offset_of!(F, serverRecenterEpoch),
+                offset_of!(F, inverseRecenteringOrigin),
+                offset_of!(F, reserved1)
+            ],
+            [0, 4, 20, 24, 32, 40, 48, 76, 80, 88, 96, 104, 112, 140]
+        );
+        let mut registry = AuthoritySessionRegistry::default();
+        let mut state = registry
+            .start(HmdAuthoritySessionEpoch(std::array::from_fn(|i| i as u8)))
+            .unwrap();
+        state.begin();
+        let evidence = state
+            .sample(
+                -7,
+                Pose {
+                    position: Vec3::new(-0.0, f32::from_bits(1), f32::MAX),
+                    orientation: Quat::IDENTITY,
+                },
+                HmdRawValidity {
+                    position_tracked: true,
+                    view_orientation_valid: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let mut sample = alvr_server_core::MotionHistorySample {
+            tracking_timestamp: Duration::from_nanos(110),
+            motion: DeviceMotion::IDENTITY,
+            hmd_authority: Some(evidence),
+            server_recenter_epoch: 9,
+            inverse_recentering_origin: Pose::IDENTITY,
+        };
+        let ffi =
+            to_ffi_hmd_authority(sample, Duration::from_nanos(105), Duration::from_nanos(120));
+        assert_eq!(ffi.present, 1u32);
+        assert_eq!(ffi.sessionEpoch, evidence.session_epoch.0);
+        assert_eq!(ffi.observationId, 0u64);
+        assert_eq!(ffi.referenceSpaceGeneration, 0u64);
+        assert_eq!(ffi.sourceLocateTime, -7i64);
+        assert_eq!(ffi.rawValidityBits, 36u32);
+        assert_eq!(ffi.selectedTrackingTimestamp, 110);
+        assert_eq!(ffi.predictionFromTimestamp, 105);
+        assert_eq!(ffi.predictionTargetTimestamp, 120);
+        assert_eq!(ffi.serverRecenterEpoch, 9);
+        if let Ok(directory) = std::env::var("MONAKA_ALVR_AUTHORITY_FIXTURE_DIR") {
+            std::fs::create_dir_all(&directory).unwrap();
+            // All bytes have fields: offset/size assertions above prove no implicit padding.
+            let bytes = unsafe {
+                std::slice::from_raw_parts((&ffi as *const F).cast::<u8>(), size_of::<F>())
+            };
+            std::fs::write(std::path::Path::new(&directory).join("rust-ffi.bin"), bytes).unwrap();
+        }
+        assert_eq!(
+            ffi.sourcePose.position.map(f32::to_bits),
+            evidence.source_pose.position.to_array().map(f32::to_bits)
+        );
+        sample.hmd_authority = None;
+        assert_eq!(
+            to_ffi_hmd_authority(sample, Duration::ZERO, Duration::ZERO).present,
+            0
+        );
+        sample.hmd_authority = Some(evidence);
+        assert_eq!(
+            to_ffi_hmd_authority(sample, Duration::MAX, Duration::ZERO).present,
+            0
+        );
     }
 }

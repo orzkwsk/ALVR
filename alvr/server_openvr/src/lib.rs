@@ -313,10 +313,18 @@ fn spawn_event_loop(events_receiver: mpsc::Receiver<ServerCoreEvent>) {
                         let target_controller_timestamp =
                             target_timestamp.saturating_sub(controllers_pose_time_offset);
 
-                        let ffi_head_motion = if let Some(motion) =
-                            context.get_device_motion(*HEAD_ID, poll_timestamp)
+                        let mut ffi_hmd_authority = FfiHmdAuthorityEvidenceV1::default();
+                        let ffi_head_motion = if let Some(sample) =
+                            context.get_device_motion_sample(*HEAD_ID, poll_timestamp)
                         {
-                            let motion = motion.predict(poll_timestamp, target_timestamp);
+                            ffi_hmd_authority = tracking::to_ffi_hmd_authority(
+                                sample,
+                                poll_timestamp,
+                                target_timestamp,
+                            );
+                            // Preserve the existing prediction baseline/behavior; record both that
+                            // query timestamp and the ACTUAL selected history timestamp separately.
+                            let motion = sample.motion.predict(poll_timestamp, target_timestamp);
 
                             let mut head_pose_queue_lock = HEAD_POSE_QUEUE.lock();
                             head_pose_queue_lock.push_back((poll_timestamp, motion.pose));
@@ -456,6 +464,7 @@ fn spawn_event_loop(events_receiver: mpsc::Receiver<ServerCoreEvent>) {
                                 poll_timestamp.as_nanos() as _,
                                 controllers_pose_time_offset.as_secs_f32(),
                                 ffi_head_motion,
+                                ffi_hmd_authority,
                                 ffi_left_hand_data,
                                 ffi_right_hand_data,
                                 ffi_body_tracker_motions.as_ptr(),

@@ -1,6 +1,7 @@
 mod average;
 mod c_api;
 mod connection_result;
+pub mod hmd_authority;
 pub mod inputs;
 mod logging;
 mod primitives;

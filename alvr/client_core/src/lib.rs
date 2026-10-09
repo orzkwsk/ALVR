@@ -224,7 +224,8 @@ impl ClientCoreContext {
         }
     }
 
-    pub fn send_tracking(&self, data: TrackingData) {
+    pub fn send_tracking(&self, mut data: TrackingData) {
+        data.validate_hmd_authority();
         dbg_client_core!("send_tracking");
 
         if let Some(sender) = &mut *self.connection_context.tracking_sender.lock() {

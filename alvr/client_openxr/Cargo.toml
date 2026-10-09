@@ -18,6 +18,7 @@ alvr_system_info.workspace = true
 
 jni = "0.22"
 openxr = "0.21"
+getrandom = "0.3"
 
 [target.'cfg(target_os = "android")'.dependencies]
 # Pinning android-activity to 0.6.0. v0.6.1 changed ndk-context initialization from Activity to
