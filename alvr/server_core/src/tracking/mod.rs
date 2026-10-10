@@ -66,6 +66,7 @@ pub struct MotionHistorySample {
 }
 
 pub struct TrackingManager {
+    authority_export: Option<crate::authority_export::AuthorityExport>,
     authority_receiver: AuthorityReceiver,
     server_recenter_epoch: u64,
     last_head_pose: Pose,             // client's reference space
@@ -77,8 +78,14 @@ pub struct TrackingManager {
 }
 
 impl TrackingManager {
+    pub fn disconnect_authority_export(&mut self, event: &'static str) {
+        if let Some(export) = &mut self.authority_export {
+            export.disconnect(event);
+        }
+    }
     pub fn new(max_history_size: usize) -> TrackingManager {
         TrackingManager {
+            authority_export: crate::authority_export::AuthorityExport::configured(),
             authority_receiver: AuthorityReceiver::default(),
             server_recenter_epoch: 0,
             last_head_pose: Pose::IDENTITY,
@@ -141,6 +148,7 @@ impl TrackingManager {
 
     /// Network reconnect clears generic history but never resets source replay high-water.
     pub fn reset_history(&mut self, max_history_size: usize) {
+        self.disconnect_authority_export("disconnect");
         self.max_history_size = max_history_size;
         self.last_head_pose = Pose::IDENTITY;
         self.set_recenter_mapping(Pose::IDENTITY);
@@ -172,12 +180,24 @@ impl TrackingManager {
             .iter()
             .filter(|(id, _)| *id == *inp::HEAD_ID)
             .collect();
-        let authority = hmd_authority
+        let received = hmd_authority
             .filter(|e| heads.len() == 1 && pose_bits(heads[0].1.pose) == pose_bits(e.source_pose))
-            .filter(|e| {
-                self.server_recenter_epoch != u64::MAX
-                    && self.authority_receiver.receive(*e) == AuthorityReceiveResult::Accepted
-            });
+            .filter(|_| self.server_recenter_epoch != u64::MAX)
+            .map(|e| (e, self.authority_receiver.receive(e)));
+        let authority = received
+            .filter(|(_, result)| *result == AuthorityReceiveResult::Accepted)
+            .map(|(e, _)| e);
+        if let Some(export) = &mut self.authority_export {
+            if let Some(e) = authority {
+                export.observe(e);
+            } else if received
+                .is_some_and(|(e, _)| self.authority_receiver.eligible(e.session_epoch))
+            {
+                export.reject();
+            } else {
+                export.disconnect("authority-lost");
+            }
+        }
         let mut device_motion_configs = HashMap::new();
         device_motion_configs.insert(*inp::HEAD_ID, MotionConfig::default());
         device_motion_configs.extend([
@@ -415,9 +435,17 @@ pub fn tracking_loop(
         let data = match tracking_receiver.recv(STREAMING_RECV_TIMEOUT) {
             Ok(tracking) => tracking,
             Err(ConnectionError::TryAgain(_)) => continue,
-            Err(ConnectionError::Other(_)) => return,
+            Err(ConnectionError::Other(_)) => {
+                ctx.tracking_manager
+                    .write()
+                    .disconnect_authority_export("stream-failure");
+                return;
+            }
         };
         let Ok(mut tracking) = data.get_header() else {
+            ctx.tracking_manager
+                .write()
+                .disconnect_authority_export("stream-failure");
             return;
         };
 
@@ -646,4 +674,7 @@ pub fn tracking_loop(
             sink.send_tracking(&device_motions);
         }
     }
+    ctx.tracking_manager
+        .write()
+        .disconnect_authority_export("disconnect");
 }

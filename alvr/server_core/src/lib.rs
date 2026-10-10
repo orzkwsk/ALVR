@@ -1,3 +1,4 @@
+mod authority_export;
 mod bitrate;
 mod c_api;
 mod connection;
